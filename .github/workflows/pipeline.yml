@@ -1,0 +1,282 @@
+name: Backend Pipeline
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '20'
+  WORKING_DIR: ./backend
+  ARTIFACT_NAME: backend-build
+
+jobs:
+  test:
+    name: Test Backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ env.WORKING_DIR }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+
+      - name: Run tests
+        run: npm test
+
+  build:
+    name: Build Backend
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ env.WORKING_DIR }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+
+      - name: Build application
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          retention-days: 7
+          path: |
+            backend/dist/
+            backend/package.json
+            backend/package-lock.json
+            backend/prisma/
+
+  deploy:
+    name: Deploy Backend
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 25
+    environment: production
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: artifact
+
+      - name: Configure SSH
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${EC2_HOST}" ]; then
+            echo "::error::EC2_HOST secret is missing or empty"
+            exit 1
+          fi
+          if [ -z "${EC2_SSH_KEY}" ]; then
+            echo "::error::EC2_SSH_KEY secret is missing or empty"
+            exit 1
+          fi
+
+          install -m 700 -d "${HOME}/.ssh"
+          printf '%s\n' "${EC2_SSH_KEY}" > "${HOME}/.ssh/id_rsa"
+          chmod 600 "${HOME}/.ssh/id_rsa"
+          echo "SSH key configured for host: ${EC2_HOST}"
+
+      - name: Bootstrap EC2 services
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_PATH: ${{ secrets.EC2_PATH }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          DATABASE_URL_B64=$(printf '%s' "$DATABASE_URL" | base64 -w 0)
+          ssh -i "${HOME}/.ssh/id_rsa" -o StrictHostKeyChecking=accept-new \
+            "${EC2_USER}@${EC2_HOST}" \
+            "EC2_PATH='${EC2_PATH}' DATABASE_URL_B64='${DATABASE_URL_B64}' bash -s" << 'BOOTSTRAP'
+          set -euo pipefail
+
+          DATABASE_URL="$(printf '%s' "$DATABASE_URL_B64" | base64 -d)"
+          UPLOADS_PATH="$(dirname "$EC2_PATH")/uploads"
+
+          sudo mkdir -p "$EC2_PATH" "$UPLOADS_PATH"
+          sudo chown -R "$USER:$USER" "$EC2_PATH" "$UPLOADS_PATH"
+
+          install_node() {
+            if command -v node >/dev/null 2>&1 && node -v | grep -qE '^v20\.'; then
+              echo "Node.js 20 already installed"
+              return
+            fi
+            if [ -f /etc/os-release ]; then
+              . /etc/os-release
+              if [[ "${ID}" == "amzn" || "${ID}" == "rhel" || "${ID_LIKE}" == *"rhel"* ]]; then
+                curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
+                sudo yum install -y nodejs
+              elif [[ "${ID}" == "ubuntu" || "${ID}" == "debian" ]]; then
+                curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+                sudo apt-get install -y nodejs
+              else
+                echo "Unsupported OS for automatic Node.js installation: ${ID}" >&2
+                exit 1
+              fi
+            fi
+          }
+
+          install_pm2() {
+            if command -v pm2 >/dev/null 2>&1; then
+              echo "PM2 already installed"
+              return
+            fi
+            sudo npm install -g pm2
+          }
+
+          install_docker() {
+            if command -v docker >/dev/null 2>&1; then
+              echo "Docker already installed"
+            elif [ -f /etc/os-release ]; then
+              . /etc/os-release
+              if [[ "${ID}" == "amzn" || "${ID}" == "rhel" || "${ID_LIKE}" == *"rhel"* ]]; then
+                sudo yum install -y docker
+              elif [[ "${ID}" == "ubuntu" || "${ID}" == "debian" ]]; then
+                sudo apt-get update
+                sudo apt-get install -y docker.io
+              else
+                echo "Unsupported OS for automatic Docker installation: ${ID}" >&2
+                exit 1
+              fi
+            fi
+            sudo systemctl enable docker
+            sudo systemctl start docker
+            sudo usermod -aG docker "$USER" || true
+          }
+
+          start_postgres() {
+            if [[ ! "$DATABASE_URL" =~ postgresql://([^:]+):([^@]+)@([^:/]+):?([0-9]*)/(.+) ]]; then
+              echo "Invalid DATABASE_URL format" >&2
+              exit 1
+            fi
+
+            DB_USER="${BASH_REMATCH[1]}"
+            DB_PASSWORD="${BASH_REMATCH[2]}"
+            DB_HOST="${BASH_REMATCH[3]}"
+            DB_PORT="${BASH_REMATCH[4]:-5432}"
+            DB_NAME="${BASH_REMATCH[5]}"
+
+            if [ "$DB_HOST" = "localhost" ] || [ "$DB_HOST" = "127.0.0.1" ]; then
+              if ! sudo docker ps --format '{{.Names}}' | grep -q '^lti-postgres$'; then
+                if sudo docker ps -a --format '{{.Names}}' | grep -q '^lti-postgres$'; then
+                  sudo docker start lti-postgres
+                else
+                  sudo docker run -d \
+                    --name lti-postgres \
+                    --restart always \
+                    -e POSTGRES_USER="$DB_USER" \
+                    -e POSTGRES_PASSWORD="$DB_PASSWORD" \
+                    -e POSTGRES_DB="$DB_NAME" \
+                    -p "${DB_PORT}:5432" \
+                    postgres:16
+                fi
+              else
+                echo "PostgreSQL container already running"
+              fi
+            else
+              echo "External database configured at ${DB_HOST}; skipping local PostgreSQL setup"
+            fi
+          }
+
+          setup_env() {
+            if [ ! -f "${EC2_PATH}/.env" ]; then
+              printf 'DATABASE_URL=%s\n' "$DATABASE_URL" > "${EC2_PATH}/.env"
+              chmod 600 "${EC2_PATH}/.env"
+              echo ".env created"
+            else
+              echo ".env already exists; keeping existing file"
+            fi
+          }
+
+          install_node
+          install_pm2
+          install_docker
+          start_postgres
+          setup_env
+          BOOTSTRAP
+
+      - name: Copy artifact to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_PATH: ${{ secrets.EC2_PATH }}
+        run: |
+          ls -la artifact/
+          rsync -avz --delete \
+            --exclude '.env' \
+            -e "ssh -i ${HOME}/.ssh/id_rsa -o StrictHostKeyChecking=accept-new" \
+            artifact/ \
+            "${EC2_USER}@${EC2_HOST}:${EC2_PATH}/"
+
+      - name: Deploy on EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_PATH: ${{ secrets.EC2_PATH }}
+        run: |
+          ssh -i "${HOME}/.ssh/id_rsa" -o StrictHostKeyChecking=accept-new \
+            "${EC2_USER}@${EC2_HOST}" \
+            "cd ${EC2_PATH} && \
+             npm ci --omit=dev && \
+             npx prisma generate && \
+             npx prisma migrate deploy && \
+             if pm2 describe lti-backend > /dev/null 2>&1; then \
+               pm2 reload lti-backend; \
+             else \
+               pm2 start dist/index.js --name lti-backend; \
+             fi && \
+             pm2 save"
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f "${HOME}/.ssh/id_rsa"
