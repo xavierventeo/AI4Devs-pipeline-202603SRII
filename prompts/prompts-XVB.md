@@ -66,6 +66,8 @@ Partiendo del workflow anterior, añade un job `build` con `needs: test`:
 
 Devuélveme el YAML actualizado con jobs `test` y `build`. Sin deploy aún.
 
+> **Nota:** El job `build` no se puede probar como pipeline en local (solo opcionalmente `npm run build` en `./backend`). Para relanzar el workflow, se debe hacer commit en local y push de los cambios a la rama del PR ya abierto; el evento `synchronize` reejecutará automáticamente los jobs `test` y `build` sin necesidad de crear un PR nuevo. Verifica en *Checks* que ambos pasan antes de continuar con el deploy.
+
 ---
 
 ## Prompt 5: Despliegue del backend en EC2
@@ -98,3 +100,19 @@ Revisa el workflow completo en `.github/workflows/pipeline.yml` y valida:
 * Posibles mejoras de rendimiento y mantenibilidad (`concurrency`, variables globales).
 
 Genera una lista de recomendaciones y la versión final optimizada del workflow.
+
+> **Nota final:** Tras la revisión del Prompt 6, el fichero `.github/workflows/pipeline.yml` se ajustó aplicando las recomendaciones finales: `concurrency` con cancelación de runs en progreso, `permissions: contents: read`, variable global `ARTIFACT_NAME`, `timeout-minutes` por job, `retention-days` en el artifact, `environment: production` en deploy, `--exclude '.env'` en rsync para no borrar el `.env` de EC2, y limpieza de la clave SSH al finalizar. Los jobs `test` y `build` funcionan sin secrets; el job `deploy` fallará hasta configurarlos. Si el deploy falla por falta de secrets, se puede relanzar con **Re-run failed jobs** en GitHub Actions una vez configurados.
+
+### Secrets a configurar en GitHub
+
+Configurar en el fork: **Settings → Secrets and variables → Actions → New repository secret**.
+
+| Secret | Obligatorio para | Descripción | Ejemplo |
+|---|---|---|---|
+| `EC2_HOST` | `deploy` | IP pública o DNS de la instancia EC2 | `54.123.45.67` |
+| `EC2_USER` | `deploy` | Usuario SSH de la instancia | `ec2-user` (Amazon Linux) / `ubuntu` |
+| `EC2_SSH_KEY` | `deploy` | Contenido completo de la clave privada `.pem` | `-----BEGIN RSA PRIVATE KEY-----...` |
+| `EC2_PATH` | `deploy` | Ruta de despliegue en el servidor | `/home/ec2-user/lti-backend` |
+| `DATABASE_URL` | Solo si hay tests de integración con PostgreSQL en CI | Cadena de conexión a PostgreSQL | No necesario con los tests actuales (mockean Prisma) |
+
+Además, en EC2 deben existir previamente (fuera de GitHub Secrets): Node.js 20, PM2, PostgreSQL accesible y el fichero `.env` con `DATABASE_URL` en `EC2_PATH`.
