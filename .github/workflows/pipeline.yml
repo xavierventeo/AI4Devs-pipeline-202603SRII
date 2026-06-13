@@ -111,10 +111,24 @@ jobs:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
         run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+          set -euo pipefail
+
+          if [ -z "${EC2_HOST}" ]; then
+            echo "::error::EC2_HOST secret is missing or empty"
+            exit 1
+          fi
+          if [ -z "${EC2_SSH_KEY}" ]; then
+            echo "::error::EC2_SSH_KEY secret is missing or empty"
+            exit 1
+          fi
+
+          install -m 700 -d "${HOME}/.ssh"
+          printf '%s\n' "${EC2_SSH_KEY}" > "${HOME}/.ssh/id_rsa"
+          chmod 600 "${HOME}/.ssh/id_rsa"
+
+          if ! ssh-keyscan -H "${EC2_HOST}" >> "${HOME}/.ssh/known_hosts" 2>/dev/null; then
+            echo "::warning::ssh-keyscan failed; using StrictHostKeyChecking=accept-new"
+          fi
 
       - name: Bootstrap EC2 services
         env:
@@ -124,7 +138,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           DATABASE_URL_B64=$(printf '%s' "$DATABASE_URL" | base64 -w 0)
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=yes \
+          ssh -i "${HOME}/.ssh/id_rsa" -o StrictHostKeyChecking=accept-new \
             "${EC2_USER}@${EC2_HOST}" \
             "EC2_PATH='${EC2_PATH}' DATABASE_URL_B64='${DATABASE_URL_B64}' bash -s" << 'BOOTSTRAP'
           set -euo pipefail
@@ -242,7 +256,7 @@ jobs:
         run: |
           rsync -avz --delete \
             --exclude '.env' \
-            -e "ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=yes" \
+            -e "ssh -i ${HOME}/.ssh/id_rsa -o StrictHostKeyChecking=accept-new" \
             artifact/backend/ \
             "${EC2_USER}@${EC2_HOST}:${EC2_PATH}/"
 
@@ -252,7 +266,7 @@ jobs:
           EC2_USER: ${{ secrets.EC2_USER }}
           EC2_PATH: ${{ secrets.EC2_PATH }}
         run: |
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=yes \
+          ssh -i "${HOME}/.ssh/id_rsa" -o StrictHostKeyChecking=accept-new \
             "${EC2_USER}@${EC2_HOST}" \
             "cd ${EC2_PATH} && \
              npm ci --omit=dev && \
@@ -267,4 +281,4 @@ jobs:
 
       - name: Cleanup SSH key
         if: always()
-        run: rm -f ~/.ssh/id_rsa
+        run: rm -f "${HOME}/.ssh/id_rsa"
