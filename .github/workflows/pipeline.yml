@@ -125,10 +125,7 @@ jobs:
           install -m 700 -d "${HOME}/.ssh"
           printf '%s\n' "${EC2_SSH_KEY}" > "${HOME}/.ssh/id_rsa"
           chmod 600 "${HOME}/.ssh/id_rsa"
-
-          if ! ssh-keyscan -H "${EC2_HOST}" >> "${HOME}/.ssh/known_hosts" 2>/dev/null; then
-            echo "::warning::ssh-keyscan failed; using StrictHostKeyChecking=accept-new"
-          fi
+          echo "SSH key configured for host: ${EC2_HOST}"
 
       - name: Bootstrap EC2 services
         env:
