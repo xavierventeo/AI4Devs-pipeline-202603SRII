@@ -101,7 +101,7 @@ Revisa el workflow completo en `.github/workflows/pipeline.yml` y valida:
 
 Genera una lista de recomendaciones y la versión final optimizada del workflow.
 
-> **Nota final:** Tras la revisión del Prompt 6, el fichero `.github/workflows/pipeline.yml` se ajustó aplicando las recomendaciones finales: `concurrency` con cancelación de runs en progreso, `permissions: contents: read`, variable global `ARTIFACT_NAME`, `timeout-minutes` por job, `retention-days` en el artifact, `environment: production` en deploy, `--exclude '.env'` en rsync para no borrar el `.env` de EC2, y limpieza de la clave SSH al finalizar. Los jobs `test` y `build` funcionan sin secrets; el job `deploy` fallará hasta configurarlos. Si el deploy falla por falta de secrets, se puede relanzar con **Re-run failed jobs** en GitHub Actions una vez configurados.
+> **Nota final:** Tras la revisión del Prompt 6, el fichero `.github/workflows/pipeline.yml` se ajustó aplicando las recomendaciones finales: `concurrency` con cancelación de runs en progreso, `permissions: contents: read`, variable global `ARTIFACT_NAME`, `timeout-minutes` por job, `retention-days` en el artifact, `environment: production` en deploy, `--exclude '.env'` en rsync para no borrar el `.env` de EC2, y limpieza de la clave SSH al finalizar. Los jobs `test` y `build` funcionan sin secrets; el job `deploy` fallará hasta configurarlos. Si el deploy falla por falta de secrets, se puede relanzar con **Re-run failed jobs** en GitHub Actions una vez configurados. Con el **Prompt 7 (extra)**, el deploy también instala automáticamente Node.js, PM2, Docker y PostgreSQL si no están presentes en EC2.
 
 ### Secrets a configurar en GitHub
 
@@ -113,6 +113,35 @@ Configurar en el fork: **Settings → Secrets and variables → Actions → New 
 | `EC2_USER` | `deploy` | Usuario SSH de la instancia | `ec2-user` (Amazon Linux) / `ubuntu` |
 | `EC2_SSH_KEY` | `deploy` | Contenido completo de la clave privada `.pem` | `-----BEGIN RSA PRIVATE KEY-----...` |
 | `EC2_PATH` | `deploy` | Ruta de despliegue en el servidor | `/home/ec2-user/lti-backend` |
-| `DATABASE_URL` | Solo si hay tests de integración con PostgreSQL en CI | Cadena de conexión a PostgreSQL | No necesario con los tests actuales (mockean Prisma) |
+| `DATABASE_URL` | `deploy` (con Prompt 7 extra) | Cadena de conexión PostgreSQL; crea `.env` y levanta contenedor local si apunta a `localhost` | `postgresql://LTIdbUser:password@localhost:5432/LTIdb` |
 
-Además, en EC2 deben existir previamente (fuera de GitHub Secrets): Node.js 20, PM2, PostgreSQL accesible y el fichero `.env` con `DATABASE_URL` en `EC2_PATH`.
+Con el **Prompt 7 (extra)** ya no es necesario instalar manualmente Node.js, PM2, PostgreSQL ni `.env` en EC2. Solo debe existir la instancia EC2 con acceso SSH y permisos `sudo`.
+
+---
+
+## Prompt 7 (extra): Bootstrap automático de servicios en EC2
+
+Actúa como un DevOps Senior experto en AWS y GitHub Actions.
+
+Amplía el job `deploy` del workflow para que, **antes de copiar el artifact**, instale automáticamente en EC2 los servicios que falten:
+
+* **Node.js 20** — si no está instalado o no es la versión 20.
+* **PM2** — si no está instalado globalmente.
+* **Docker** — si no está instalado (necesario para PostgreSQL local).
+* **PostgreSQL** — contenedor Docker `lti-postgres` si `DATABASE_URL` apunta a `localhost` y el contenedor no existe.
+* **`.env`** — crear en `EC2_PATH` solo si no existe, usando el secret `DATABASE_URL` (nunca subir `.env` desde el repo).
+* **Directorio `uploads/`** — crear en el directorio padre de `EC2_PATH` para subida de CVs.
+
+Requisitos adicionales:
+
+* Detectar Amazon Linux / RHEL / Ubuntu para usar el gestor de paquetes correcto.
+* Pasar `DATABASE_URL` al servidor de forma segura (por ejemplo, codificada en base64).
+* Mantener `--exclude '.env'` en rsync para no sobrescribir el `.env` existente.
+* Añadir `npx prisma migrate deploy` y `pm2 save` tras el despliegue.
+* Aumentar `timeout-minutes` del job `deploy` (bootstrap puede tardar varios minutos).
+
+Actualiza la tabla de secrets indicando que `DATABASE_URL` pasa a ser **obligatorio para `deploy`** cuando se usa bootstrap automático.
+
+Devuélveme el YAML actualizado y la documentación de los secrets necesarios.
+
+> **Nota:** Este prompt es **extra** y va más allá del ejercicio base. Automatiza el aprovisionamiento inicial de la instancia, pero la EC2 debe existir previamente con acceso SSH y el usuario debe tener permisos `sudo`. Si `DATABASE_URL` apunta a una base de datos externa (RDS, etc.), el script omite la creación del contenedor PostgreSQL local.
